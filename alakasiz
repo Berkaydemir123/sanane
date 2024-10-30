@@ -1,3 +1,7 @@
+[IP_Flow 19-627] Port 'o_dato': XPath expression failed: Unsupported function call or array usage "log2" found in expression "log2(spirit:decode(id('MODELPARAM_VALUE.D')))".
+
+
+
 --Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
 ----------------------------------------------------------------------------------
 --Tool Version: Vivado v.2022.2 (lin64) Build 3671981 Fri Oct 14 04:59:54 MDT 2022
