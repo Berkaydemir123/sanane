@@ -16,9 +16,14 @@ def modify_verilog(input_file, output_file):
         if re.match(r'\s*module\s+Stereo_Match\b', line) and not stereo_match_modified:
             inside_stereo_match = True
             # Add new ports to module declaration
-            modified_code.append(
-                line.strip()[:-1] + ", i_FI_CONTROL_PORT, i_SI, o_SI);\n"
-            )
+            if line.strip().endswith(');'):  # Handle the closing parenthesis
+                modified_code.append(
+                    line.strip()[:-2] + ", i_FI_CONTROL_PORT, i_SI, o_SI);\n"
+                )
+            else:
+                modified_code.append(
+                    line.strip() + ", i_FI_CONTROL_PORT, i_SI, o_SI\n"
+                )
             modified_code.append("    input [3:0] i_FI_CONTROL_PORT;\n")
             modified_code.append("    input i_SI;\n")
             modified_code.append("    output o_SI;\n\n")
@@ -44,9 +49,14 @@ def modify_verilog(input_file, output_file):
         if re.match(r'\s*module\s+shd_13_450_64_7\b', line) and not shd_module_modified:
             inside_shd_module = True
             # Add new ports to module declaration
-            modified_code.append(
-                line.strip()[:-1] + ", i_FI_CONTROL_PORT, i_SI, o_SI);\n"
-            )
+            if line.strip().endswith(');'):  # Handle the closing parenthesis
+                modified_code.append(
+                    line.strip()[:-2] + ", i_FI_CONTROL_PORT, i_SI, o_SI);\n"
+                )
+            else:
+                modified_code.append(
+                    line.strip() + ", i_FI_CONTROL_PORT, i_SI, o_SI\n"
+                )
             modified_code.append("    input [3:0] i_FI_CONTROL_PORT;\n")
             modified_code.append("    input i_SI;\n")
             modified_code.append("    output o_SI;\n\n")
@@ -203,7 +213,41 @@ def modify_verilog4(input_file, output_file):
 
 # Call the function with input and output file paths
 
+def fix_comparator_syntax(input_file, output_file):
+    with open(input_file, 'r') as file:
+        verilog_code = file.readlines()
 
+    modified_code = []
+    inside_cmp_instance = False
+    instance_lines = []
+
+    for line in verilog_code:
+        # Detect the start of a comparator instance
+        if re.match(r'\s*disp_cmp_13_64_7_sbtr\s+\\?cmp:\d+\.comparador\b', line):
+            inside_cmp_instance = True
+            instance_lines.append(line)
+            continue
+
+        # Collect instance lines until the closing `);` is added
+        if inside_cmp_instance:
+            instance_lines.append(line)
+            if re.match(r'.*o_data_d\(.*\),?$', line):  # Last port before closing
+                # Add the closing `);` if it's not present
+                if not re.search(r'\);', line):
+                    instance_lines[-1] = instance_lines[-1].rstrip(",\n") + "\n"
+                    instance_lines.append("    );\n")
+                modified_code.extend(instance_lines)
+                instance_lines = []
+                inside_cmp_instance = False
+            continue
+
+        # Append unmodified lines
+        modified_code.append(line)
+
+    with open(output_file, 'w') as file:
+        file.writelines(modified_code)
+
+    print(f"Comparator syntax fixed. Modified Verilog code written to {output_file}.")
 
 input_file_path = r"C:\Users\berka\Desktop\dsadwsqadsa\Stereo_Match.v"
 output_file_path = r"C:\Users\berka\Desktop\dsadwsqadsa\Stereo_Match_Modified.v"
@@ -211,3 +255,4 @@ modify_verilog(input_file_path, output_file_path)
 modify_verilog2(output_file_path, output_file_path)
 modify_verilog3(output_file_path, output_file_path)
 modify_verilog4(output_file_path, output_file_path)
+fix_comparator_syntax(output_file_path, output_file_path)
