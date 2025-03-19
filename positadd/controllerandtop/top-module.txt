@@ -1,0 +1,101 @@
+module top_fault_injection_system (
+    // System signals
+    input wire           clk,            // System clock
+    input wire           rst,            // System reset (active high)
+    
+    // CPU interface signals
+    input wire           cpu_wren,       // Write enable from CPU
+    input wire           cpu_rden,       // Read enable from CPU
+    input wire [1:0]     cpu_addr,       // Register address for read/write
+    input wire [31:0]    cpu_wdata,      // Data to be written to registers
+    output wire [31:0]   cpu_rdata,      // Data read from registers
+    
+    // Posit adder functional interface
+    input wire [15:0]    posit_in1,      // First posit input
+    input wire [15:0]    posit_in2,      // Second posit input  
+    input wire           posit_start,    // Start posit addition
+    output wire [15:0]   posit_out,      // Posit output
+    output wire          posit_inf,      // Infinity flag
+    output wire          posit_zero,     // Zero flag
+    output wire          posit_done      // Operation done flag
+);
+
+    // Internal signals for connecting controller to posit adder
+    wire           serial_out;           // Serial out from controller to first module
+    wire           sr_clk;               // Shift register clock
+    wire           sr_rst;               // Shift register reset
+    wire           tf_en;                // Transient fault enable
+    wire           sr_en;                // Shift register enable
+    wire [3:0]     fi_control_port;      // Combined control signals for posit FI
+    
+    // Daisy chain signals between modules
+    wire           si_dsl1;              // Serial input to dsl1
+    wire           si_dsr2;              // Serial input to dsr2
+    wire           si_ls;                // Serial input to uut_de1@ls
+    wire           si_k;                 // Serial input to uut_de1@xinst_k
+    wire           so_dsl1;              // Serial output from dsl1
+    wire           so_dsr2;              // Serial output from dsr2
+    wire           so_ls;                // Serial output from uut_de1@ls
+    wire           so_k;                 // Serial output from uut_de1@xinst_k (final output)
+
+    // Combine control signals into fi_control_port
+    assign fi_control_port[0] = sr_en;      // Enable bit
+    assign fi_control_port[1] = tf_en;      // Fault enable bit
+    assign fi_control_port[2] = sr_rst;     // Reset bit (active low)
+    assign fi_control_port[3] = sr_clk;     // Clock bit
+    
+    // Setup serial daisy chain
+    assign si_dsl1 = serial_out;  // Controller output goes to first module
+    assign si_dsr2 = so_dsl1;     // Output of dsl1 goes to dsr2
+    assign si_ls = so_dsr2;       // Output of dsr2 goes to ls
+    assign si_k = so_ls;          // Output of ls goes to k
+
+    // Reset signal adapter
+    wire system_rst_n;  // Inverted reset for controller
+    
+    // Convert system reset (active high) to controller reset (active high)
+    assign system_rst_n = rst;
+    
+    // Instantiate the controller module
+    controller fault_controller (
+        // System signals
+        .i_CLK          (clk),
+        .i_RST          (system_rst_n),
+        
+        // CPU interface signals
+        .i_WREn         (cpu_wren),
+        .i_RDEn         (cpu_rden),
+        .i_ADDR         (cpu_addr),
+        .i_WDATA        (cpu_wdata),
+        .o_RDATA        (cpu_rdata),
+        
+        // Target hardware interface signals
+        .o_SERIAL_OUT   (serial_out),
+        .o_SR_CLK       (sr_clk),
+        .o_SR_RST       (sr_rst),      // Controller generates active-low reset
+        .o_TFEn         (tf_en),
+        .o_SR_EN        (sr_en)
+    );
+
+    // Instantiate the posit adder module with fault injection
+    posit_add posit_adder (
+        // Functional interface
+        .in1            (posit_in1),
+        .in2            (posit_in2),
+        .start          (posit_start),
+        .out            (posit_out),
+        .inf            (posit_inf),
+        .zero           (posit_zero),
+        .done           (posit_done),
+        
+        // Fault injection interface
+        .i_FI_CONTROL_PORT(fi_control_port),
+        .i_SI           (si_dsl1),        // First module in chain
+        .o_SI           (so_k)            // Final output from the chain
+    );
+    
+    // Note: The posit_add module internally connects the modules in the 
+    // proper daisy chain order (dsl1 → dsr2 → uut_de1@ls → uut_de1@xinst_k)
+    // through the SIwire signals defined in posit_add_fi_sbtr.v
+
+endmodule

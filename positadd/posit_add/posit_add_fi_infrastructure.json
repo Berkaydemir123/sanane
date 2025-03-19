@@ -1,0 +1,22 @@
+[
+    {
+        "index": 0,
+        "path": "dsl1",
+        "module": "\\$paramod$3252fe89cd119cf7c3ef25b9a50779b2d8d95ba3\\DSR_left_N_S"
+    },
+    {
+        "index": 1,
+        "path": "dsr2",
+        "module": "\\$paramod$1bac373892e36610c5170080d2d7c9af8c4094ae\\DSR_right_N_S"
+    },
+    {
+        "index": 2,
+        "path": "uut_de1@ls",
+        "module": "\\$paramod$3252fe89cd119cf7c3ef25b9a50779b2d8d95ba3\\DSR_left_N_S"
+    },
+    {
+        "index": 3,
+        "path": "uut_de1@xinst_k",
+        "module": "\\$paramod\\LOD_N\\N=s32'00000000000000000000000000010000"
+    }
+]

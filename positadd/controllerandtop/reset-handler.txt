@@ -1,0 +1,9 @@
+module reset_handler(
+    input  wire system_rst,  // Active high system reset
+    output wire sr_rst       // Active low reset for shift registers
+);
+    
+    // Convert from active-high to active-low
+    assign sr_rst = ~system_rst;
+    
+endmodule

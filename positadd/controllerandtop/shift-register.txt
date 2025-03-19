@@ -1,0 +1,28 @@
+module shift_register #(
+	parameter WIDTH = 10
+)(
+	input i_CLK,
+	input i_RST,         // Active low reset (consistent with controller)
+	input i_EN,
+	input i_SI,
+	output [WIDTH-1:0] o_DATA
+);
+	
+	reg [WIDTH-1:0] SHIFT_REGISTER;
+	
+	
+	always @(posedge i_CLK, posedge i_RST)  // Changed to posedge i_RST for consistency
+	begin
+		if(i_RST == 1'b0) begin            // Reset when i_RST is low
+            SHIFT_REGISTER <= {WIDTH{1'b0}};
+        end
+        else begin
+            if(i_EN) begin
+			    SHIFT_REGISTER <= {i_SI, SHIFT_REGISTER[WIDTH-1:1]};
+            end
+        end
+    end
+	
+    assign o_DATA = SHIFT_REGISTER;
+	
+endmodule
