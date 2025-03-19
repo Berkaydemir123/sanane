@@ -1,0 +1,228 @@
+`timescale 1ns / 1ps
+
+module tb_fault_injection_system;
+    // System signals
+    reg           clk;
+    reg           rst;
+    
+    // CPU interface signals
+    reg           cpu_wren;
+    reg           cpu_rden;
+    reg [1:0]     cpu_addr;
+    reg [31:0]    cpu_wdata;
+    wire [31:0]   cpu_rdata;
+    
+    // Posit adder functional interface
+    reg [15:0]    posit_in1;
+    reg [15:0]    posit_in2;
+    reg           posit_start;
+    wire [15:0]   posit_out;
+    wire          posit_inf;
+    wire          posit_zero;
+    wire          posit_done;
+
+    // Instantiate the top module
+    top_fault_injection_system uut (
+        .clk(clk),
+        .rst(rst),
+        .cpu_wren(cpu_wren),
+        .cpu_rden(cpu_rden),
+        .cpu_addr(cpu_addr),
+        .cpu_wdata(cpu_wdata),
+        .cpu_rdata(cpu_rdata),
+        .posit_in1(posit_in1),
+        .posit_in2(posit_in2),
+        .posit_start(posit_start),
+        .posit_out(posit_out),
+        .posit_inf(posit_inf),
+        .posit_zero(posit_zero),
+        .posit_done(posit_done)
+    );
+
+    // Constants for register addresses
+    localparam DATA_REG        = 2'b00;
+    localparam STATUS_REG      = 2'b01;
+    localparam COUNTER_REG     = 2'b10;
+    localparam COMPARATOR_REG  = 2'b11;
+    
+    // Constants for total bits
+    localparam TOTAL_BITS = 532; // 524 enable bits + 8 control bits
+    
+    // Clock generation
+    initial begin
+        clk = 0;
+        forever #5 clk = ~clk; // 100MHz clock
+    end
+
+    // Task to write to a register
+    task write_register;
+        input [1:0] addr;
+        input [31:0] data;
+        begin
+            @(posedge clk);
+            cpu_addr = addr;
+            cpu_wdata = data;
+            cpu_wren = 1;
+            @(posedge clk);
+            cpu_wren = 0;
+            @(posedge clk);
+        end
+    endtask
+
+    // Task to read from a register
+    task read_register;
+        input [1:0] addr;
+        output [31:0] data;
+        begin
+            @(posedge clk);
+            cpu_addr = addr;
+            cpu_rden = 1;
+            @(posedge clk);
+            data = cpu_rdata;
+            cpu_rden = 0;
+            @(posedge clk);
+        end
+    endtask
+
+    // Test scenario
+    reg [31:0] read_data;
+    integer i;
+
+    initial begin
+        // Initialize signals
+        rst = 1;
+        cpu_wren = 0;
+        cpu_rden = 0;
+        cpu_addr = 0;
+        cpu_wdata = 0;
+        posit_in1 = 0;
+        posit_in2 = 0;
+        posit_start = 0;
+
+        // Apply reset
+        #20;
+        rst = 0;  // Assert system reset (active high for top module)
+        #20;
+        rst = 1;  // Release system reset
+        #20;
+
+        // Test Scenario 1: Stuck-at-1 Fault Injection
+        
+        // Set fault type to stuck-at-1 and shift register length
+        write_register(STATUS_REG, 32'h00105B0); // Fault type 01, shift length 532 (0x214)
+        
+        // Load DATA registers with enable patterns (17 writes for 524 bits)
+        // First write pattern with some bits set to 1
+        write_register(DATA_REG, 32'hAAAAAAAA); // Alternating 1s and 0s
+        
+        // Wait for busy bit to clear
+        do begin
+            read_register(STATUS_REG, read_data);
+        end while (read_data[0] == 1);
+        
+        // Continue with remaining data writes (simplifying to just a few more)
+        for (i = 1; i < 17; i = i + 1) begin
+            write_register(DATA_REG, 32'h55555555); // Different pattern
+            
+            // Wait for busy bit to clear
+            do begin
+                read_register(STATUS_REG, read_data);
+            end while (read_data[0] == 1);
+        end
+        
+        // Set SETUP bit to start loading the shift register
+        write_register(STATUS_REG, 32'h00105B8); // 0x5B0 | 0x08 (SETUP bit)
+        
+        // Wait for setup phase to complete
+        do begin
+            read_register(STATUS_REG, read_data);
+        end while (read_data[0] == 1);
+        
+        // Start the operation with faults
+        write_register(STATUS_REG, 32'h00105B4); // 0x5B0 | 0x04 (START bit)
+        
+        // Set posit inputs and start computation
+        posit_in1 = 16'h4000; // Example posit value
+        posit_in2 = 16'h5000; // Example posit value
+        posit_start = 1;
+        @(posedge clk);
+        posit_start = 0;
+        
+        // Wait for computation to complete
+        wait(posit_done);
+        
+        // Display results
+        $display("Fault Injection Result: posit_out = %h, inf = %b, zero = %b", 
+                 posit_out, posit_inf, posit_zero);
+        
+        // Test Scenario 2: Transient Fault Injection
+        
+        // Reset the system
+        rst = 0;  // Assert system reset (active high for top module)
+        #20;
+        rst = 1;  // Release system reset
+        #20;
+        
+        // Set fault type to transient and shift register length
+        write_register(STATUS_REG, 32'h00205B0); // Fault type 10, shift length 532
+        
+        // Load DATA registers with enable patterns (simplified)
+        write_register(DATA_REG, 32'h12345678);
+        
+        // Wait for busy bit to clear
+        do begin
+            read_register(STATUS_REG, read_data);
+        end while (read_data[0] == 1);
+        
+        // Continue with remaining data writes (simplified)
+        for (i = 1; i < 17; i = i + 1) begin
+            write_register(DATA_REG, 32'h87654321);
+            
+            // Wait for busy bit to clear
+            do begin
+                read_register(STATUS_REG, read_data);
+            end while (read_data[0] == 1);
+        end
+        
+        // Set SETUP bit to start loading the shift register
+        write_register(STATUS_REG, 32'h00205B8);
+        
+        // Wait for setup phase to complete
+        do begin
+            read_register(STATUS_REG, read_data);
+        end while (read_data[0] == 1);
+        
+        // Set transient fault injection time
+        write_register(COUNTER_REG, 32'h0);       // Reset counter
+        write_register(COMPARATOR_REG, 32'h5);    // Inject fault at cycle 5
+        
+        // Start the operation with faults
+        write_register(STATUS_REG, 32'h00205B4);
+        
+        // Set posit inputs and start computation
+        posit_in1 = 16'h4000;
+        posit_in2 = 16'h5000;
+        posit_start = 1;
+        @(posedge clk);
+        posit_start = 0;
+        
+        // Wait for computation to complete
+        wait(posit_done);
+        
+        // Display results
+        $display("Transient Fault Injection Result: posit_out = %h, inf = %b, zero = %b", 
+                 posit_out, posit_inf, posit_zero);
+        
+        // End simulation
+        #100;
+        $finish;
+    end
+
+    // Monitor signals
+    initial begin
+        $monitor("Time: %t, Status: %h, Counter: %d, TF_en: %b, Out: %h", 
+                 $time, read_data, uut.fault_controller.COUNTER_REG, 
+                 uut.tf_en, posit_out);
+    end
+
+endmodule

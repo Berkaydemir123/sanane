@@ -1,0 +1,391 @@
+module controller (
+    // System signals
+    input wire           i_CLK,          // System clock
+    input wire           i_RST,          // System reset (active high)
+    
+    // CPU interface signals
+    input wire           i_WREn,         // Write enable from CPU
+    input wire           i_RDEn,         // Read enable from CPU
+    input wire [1:0]     i_ADDR,         // Register address for read/write
+    input wire [31:0]    i_WDATA,        // Data to be written to registers
+    output reg [31:0]    o_RDATA,        // Data read from registers
+    
+    // Target hardware interface signals
+    output reg           o_SERIAL_OUT,   // Serial output to shift register
+    output reg           o_SR_CLK,       // Clock for shift register
+    output reg           o_SR_RST,       // Reset for shift register
+    output reg           o_TFEn,         // Transient fault enable
+    output reg           o_SR_EN         // Shift register enable
+);
+
+    // Register definitions
+    reg [31:0] DATA_REG;          // Stores saboteur enable signals
+    reg [31:0] STATUS_REG;        // Stores status information
+    reg [31:0] COUNTER_REG;       // Counter for transient fault injection timing
+    reg [31:0] COMPARATOR_REG;    // Comparator value for transient fault timing
+
+    // STATUS register bit definitions
+    localparam BUSY_BIT     = 0;  // Bit 0: Busy flag
+    localparam OP_BIT       = 1;  // Bit 1: Operation in progress
+    localparam START_BIT    = 2;  // Bit 2: Start operation
+    localparam SETUP_BIT    = 3;  // Bit 3: Setup phase
+    // Bits [19:4] = Shift register length
+    // Bits [1:0] of bits [31:20] = Control bits for fault type
+
+    // Constants for the specific FI infrastructure
+    localparam DSL1_ENABLE_BITS    = 64;
+    localparam DSR2_ENABLE_BITS    = 204;
+    localparam LS_ENABLE_BITS      = 204;
+    localparam K_ENABLE_BITS       = 52;
+    localparam TOTAL_ENABLE_BITS   = DSL1_ENABLE_BITS + DSR2_ENABLE_BITS + LS_ENABLE_BITS + K_ENABLE_BITS; // 524
+    localparam CONTROL_BITS_PER_MODULE = 2;
+    localparam TOTAL_MODULES       = 4; // dsl1, dsr2, uut_de1@ls, uut_de1@xinst_k
+    localparam TOTAL_CONTROL_BITS  = CONTROL_BITS_PER_MODULE * TOTAL_MODULES; // 8
+    
+    // Fault type definitions
+    localparam STUCK_AT_0   = 2'b00;
+    localparam STUCK_AT_1   = 2'b01;
+    localparam TRANSIENT    = 2'b10;
+
+    // Internal flags for register access
+    reg data_written;
+    reg status_written;
+    reg counter_written;
+    reg comparator_written;
+
+    // Internal counters
+    reg [15:0] CNT_SR;          // Counter for total bits sent
+    reg [5:0]  CNT_BIT;         // Counter for bits in current DATA_REG
+    reg [3:0]  CNT_CTRL;        // Counter for control bits (modified for 8 bits)
+    reg [4:0]  DATA_REG_COUNT;  // Counter for number of DATA_REG writes needed
+    
+    // Data storage for current 32-bit chunk
+    reg [31:0] CURRENT_DATA;    // Store current data chunk being processed
+
+    // FSM state definitions
+    localparam IDLE      = 3'b000;
+    localparam S1        = 3'b001;  // Setup phase 1 - Send saboteur enable bits
+    localparam LOAD_DATA = 3'b010;  // Signal to CPU to load next data chunk
+    localparam S3        = 3'b011;  // Setup phase 3 - Send control bits
+    localparam OPER      = 3'b100;  // Operation phase
+    localparam TF        = 3'b101;  // Transient fault state
+    reg [2:0] state, next_state;
+
+    // Module tracking - which module is currently receiving bits
+    reg [1:0] current_module;   // 0=dsl1, 1=dsr2, 2=ls, 3=k
+
+    // Extract important fields from STATUS_REG
+    wire [15:0] shift_reg_length = STATUS_REG[19:4];
+    wire [1:0]  fault_type       = STATUS_REG[21:20];
+    wire        setup_bit        = STATUS_REG[SETUP_BIT];
+    wire        start_bit        = STATUS_REG[START_BIT];
+    wire        busy_bit         = STATUS_REG[BUSY_BIT];
+    wire        op_bit           = STATUS_REG[OP_BIT];
+    
+    // Calculate total DATA register writes needed (ceiling of TOTAL_ENABLE_BITS/32)
+    wire [4:0] total_data_reg_writes = (TOTAL_ENABLE_BITS + 31) / 32;
+
+    // Read operation handler
+    always @(*) begin
+        if (i_RDEn) begin
+            case (i_ADDR)
+                2'b00:   o_RDATA = DATA_REG;
+                2'b01:   o_RDATA = STATUS_REG;
+                2'b10:   o_RDATA = COUNTER_REG;
+                2'b11:   o_RDATA = COMPARATOR_REG;
+                default: o_RDATA = 32'h0;
+            endcase
+        end else begin
+            o_RDATA = 32'h0;
+        end
+    end
+
+    // Write operation handler
+    always @(posedge i_CLK or posedge i_RST) begin
+        if (i_RST) begin
+            DATA_REG         <= 32'h0;
+            STATUS_REG       <= 32'h0;
+            COUNTER_REG      <= 32'h0;
+            COMPARATOR_REG   <= 32'h0;
+            data_written     <= 1'b0;
+            status_written   <= 1'b0;
+            counter_written  <= 1'b0;
+            comparator_written <= 1'b0;
+        end else begin
+            // Clear flags if busy bit is cleared
+            if (!busy_bit) begin
+                data_written     <= 1'b0;
+                status_written   <= 1'b0;
+                counter_written  <= 1'b0;
+                comparator_written <= 1'b0;
+            end
+            
+            // Write operation handling
+            if (i_WREn && !busy_bit) begin
+                case (i_ADDR)
+                    2'b00: begin
+                        DATA_REG <= i_WDATA;
+                        data_written <= 1'b1;
+                        // Store first data write immediately
+                        if (state == IDLE) begin
+                            CURRENT_DATA <= i_WDATA;
+                        end
+                    end
+                    2'b01: begin
+                        // Only allow CPU to write non-busy bits
+                        STATUS_REG[31:1] <= i_WDATA[31:1];
+                        status_written <= 1'b1;
+                    end
+                    2'b10: begin
+                        COUNTER_REG <= i_WDATA;
+                        counter_written <= 1'b1;
+                    end
+                    2'b11: begin
+                        COMPARATOR_REG <= i_WDATA;
+                        comparator_written <= 1'b1;
+                    end
+                endcase
+            end
+            
+            // Load new data when requested in LOAD_DATA state
+            if (state == LOAD_DATA && data_written) begin
+                CURRENT_DATA <= DATA_REG;
+                data_written <= 1'b0;
+            end
+            
+            // Controller can modify busy and op bits
+            if (state != IDLE) begin
+                STATUS_REG[BUSY_BIT] <= 1'b1;  // Set busy bit when not in IDLE
+            end else begin
+                STATUS_REG[BUSY_BIT] <= 1'b0;  // Clear busy bit in IDLE
+            end
+            
+            // Set operation bit when in operation phase
+            if (state == OPER || state == TF) begin
+                STATUS_REG[OP_BIT] <= 1'b1;
+            end
+            
+            // Clear setup and start bits once operation begins
+            if (state == OPER) begin
+                STATUS_REG[SETUP_BIT] <= 1'b0;
+                STATUS_REG[START_BIT] <= 1'b0;
+            end
+        end
+    end
+
+    // Counter logic for operation
+    always @(posedge i_CLK or posedge i_RST) begin
+        if (i_RST) begin
+            COUNTER_REG <= 32'h0;
+        end else if (state == OPER || state == TF) begin
+            COUNTER_REG <= COUNTER_REG + 1;
+        end
+    end
+
+    // FSM: State register
+    always @(posedge i_CLK or posedge i_RST) begin
+        if (i_RST) begin
+            state <= IDLE;
+            current_module <= 2'b00;
+        end else begin
+            state <= next_state;
+            
+            // Track which module we're currently processing
+            if (state == S1 && next_state == S1) begin
+                // Update module tracking based on bit count
+                if (CNT_SR == DSL1_ENABLE_BITS-1) 
+                    current_module <= 2'b01; // Switch to dsr2
+                else if (CNT_SR == DSL1_ENABLE_BITS + DSR2_ENABLE_BITS-1)
+                    current_module <= 2'b10; // Switch to ls
+                else if (CNT_SR == DSL1_ENABLE_BITS + DSR2_ENABLE_BITS + LS_ENABLE_BITS-1)
+                    current_module <= 2'b11; // Switch to k
+            end
+            else if (state == IDLE && next_state == S1) begin
+                current_module <= 2'b00; // Reset to dsl1 at start
+            end
+        end
+    end
+
+    // FSM: Next state logic
+    always @(*) begin
+        next_state = state;
+        
+        case (state)
+            IDLE: begin
+                if (status_written && setup_bit) begin
+                    next_state = S1;
+                end
+            end
+            
+            S1: begin
+                if (CNT_SR >= TOTAL_ENABLE_BITS-1) begin
+                    // All enable bits sent, move to control bits
+                    next_state = S3;
+                end
+                else if (CNT_BIT >= 31) begin
+                    // Need more data from CPU
+                    if (DATA_REG_COUNT < total_data_reg_writes-1) begin
+                        next_state = LOAD_DATA;
+                    end
+                end
+            end
+            
+            LOAD_DATA: begin
+                if (data_written) begin
+                    // Got new data, continue sending bits
+                    next_state = S1;
+                end
+            end
+            
+            S3: begin
+                if (CNT_CTRL >= TOTAL_CONTROL_BITS-1) begin
+                    // All control bits sent, setup complete
+                    next_state = IDLE;
+                end
+            end
+            
+            IDLE: begin
+                if (start_bit) begin
+                    next_state = OPER;
+                end
+            end
+            
+            OPER: begin
+                if (fault_type[1] && COUNTER_REG == COMPARATOR_REG) begin
+                    next_state = TF;
+                end
+            end
+            
+            TF: begin
+                next_state = OPER;
+            end
+            
+            default: next_state = IDLE;
+        endcase
+        
+        // Reset can always return to IDLE
+        if (i_RST) begin
+            next_state = IDLE;
+        end
+    end
+
+    // Internal counters logic
+    always @(posedge i_CLK or posedge i_RST) begin
+        if (i_RST) begin
+            CNT_SR <= 16'h0;
+            CNT_BIT <= 6'h0;
+            CNT_CTRL <= 4'h0;
+            DATA_REG_COUNT <= 5'h0;
+        end else begin
+            case (state)
+                IDLE: begin
+                    CNT_SR <= 16'h0;
+                    CNT_BIT <= 6'h0;
+                    CNT_CTRL <= 4'h0;
+                    DATA_REG_COUNT <= 5'h0;
+                end
+                
+                S1: begin
+                    if (o_SR_CLK) begin
+                        CNT_SR <= CNT_SR + 1;
+                        CNT_BIT <= CNT_BIT + 1;
+                        
+                        // When we reach 32 bits, reset CNT_BIT
+                        if (CNT_BIT >= 31) begin
+                            CNT_BIT <= 6'h0;
+                            DATA_REG_COUNT <= DATA_REG_COUNT + 1;
+                        end
+                    end
+                end
+                
+                LOAD_DATA: begin
+                    // Keep counters unchanged while waiting for new data
+                end
+                
+                S3: begin
+                    if (o_SR_CLK) begin
+                        CNT_CTRL <= CNT_CTRL + 1;
+                    end
+                end
+            endcase
+        end
+    end
+
+    // Control bits determination based on current module
+    wire [1:0] current_control_bits;
+    assign current_control_bits = fault_type;
+
+    // Output logic
+    always @(posedge i_CLK or posedge i_RST) begin
+        if (i_RST) begin
+            o_SERIAL_OUT <= 1'b0;
+            o_SR_CLK <= 1'b0;
+            o_SR_RST <= 1'b0;  // Active low reset (to match shift_register.v)  // Active low reset (to match shift_register.v)
+            o_TFEn <= 1'b0;
+            o_SR_EN <= 1'b0;
+        end else begin
+            // Default values
+            o_SR_CLK <= 1'b0;
+            o_SR_RST <= 1'b0;
+            
+            case (state)
+                IDLE: begin
+                    o_SR_EN <= 1'b0;
+                    o_TFEn <= 1'b0;
+                end
+                
+                S1: begin
+                    o_SR_EN <= 1'b1;
+                    o_SERIAL_OUT <= CURRENT_DATA[CNT_BIT];
+                    o_SR_CLK <= ~o_SR_CLK;  // Toggle clock for shift register
+                end
+                
+                LOAD_DATA: begin
+                    // Hold previous values while waiting for new data
+                    o_SR_EN <= 1'b1;
+                end
+                
+                S3: begin
+                    o_SR_EN <= 1'b1;
+                    
+                    // Select appropriate control bits based on module and position
+                    case (CNT_CTRL[2:1]) // Which module (0-3)
+                        2'b00: // dsl1 control bits
+                            o_SERIAL_OUT <= fault_type[CNT_CTRL[0]];
+                        2'b01: // dsr2 control bits
+                            o_SERIAL_OUT <= fault_type[CNT_CTRL[0]];
+                        2'b10: // ls control bits
+                            o_SERIAL_OUT <= fault_type[CNT_CTRL[0]];
+                        2'b11: // k control bits
+                            o_SERIAL_OUT <= fault_type[CNT_CTRL[0]];
+                    endcase
+                    
+                    o_SR_CLK <= ~o_SR_CLK;  // Toggle clock for shift register
+                end
+                
+                OPER: begin
+                    // Enable fault injection according to fault type
+                    case (fault_type)
+                        STUCK_AT_0, STUCK_AT_1: begin
+                            o_TFEn <= 1'b1;  // Always enabled for stuck-at faults
+                        end
+                        TRANSIENT: begin
+                            o_TFEn <= 1'b0;  // Will be enabled in TF state
+                        end
+                        default: o_TFEn <= 1'b0;
+                    endcase
+                end
+                
+                TF: begin
+                    o_TFEn <= 1'b1;  // Enable for one clock cycle for transient fault
+                end
+                
+                default: begin
+                    o_SR_EN <= 1'b0;
+                    o_TFEn <= 1'b0;
+                end
+            endcase
+        end
+    end
+
+endmodule
