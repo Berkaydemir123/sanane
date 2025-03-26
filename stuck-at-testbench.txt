@@ -1,0 +1,263 @@
+#include "Vtop_fault_injection_system.h"
+#include "verilated.h"
+#include "verilated_vcd_c.h"
+#include <iostream>
+#include <iomanip>
+
+// Register addresses
+#define DATA_REG        0
+#define STATUS_REG      1
+#define COUNTER_REG     2
+#define COMPARATOR_REG  3
+
+// Simple clock cycle counter
+vluint64_t main_time = 0;
+
+// Function to handle time
+double sc_time_stamp() {
+    return main_time;
+}
+
+// Function to toggle clock for a number of cycles
+void toggle_clock(Vtop_fault_injection_system* top, VerilatedVcdC* tfp, int num_cycles) {
+    for (int i = 0; i < num_cycles; i++) {
+        // Clock high
+        top->clk = 1;
+        top->eval();
+        tfp->dump(main_time++);
+        
+        // Clock low
+        top->clk = 0;
+        top->eval();
+        tfp->dump(main_time++);
+    }
+}
+
+// Function to write to a register
+void write_register(Vtop_fault_injection_system* top, VerilatedVcdC* tfp, uint8_t addr, uint32_t data) {
+    // Set up write
+    top->cpu_addr = addr;
+    top->cpu_wdata = data;
+    top->cpu_wren = 1;
+    
+    // Clock cycle to perform write
+    toggle_clock(top, tfp, 1);
+    
+    // Deassert write enable
+    top->cpu_wren = 0;
+    
+    // Extra cycle for settling
+    toggle_clock(top, tfp, 1);
+    
+    std::cout << "Wrote 0x" << std::hex << data << " to register " << (int)addr << std::dec << std::endl;
+}
+
+// Function to read from a register
+uint32_t read_register(Vtop_fault_injection_system* top, VerilatedVcdC* tfp, uint8_t addr) {
+    // Set up read
+    top->cpu_addr = addr;
+    top->cpu_rden = 1;
+    
+    // Clock cycle to perform read
+    toggle_clock(top, tfp, 1);
+    
+    // Capture data
+    uint32_t data = top->cpu_rdata;
+    
+    // Deassert read enable
+    top->cpu_rden = 0;
+    
+    // Extra cycle for settling
+    toggle_clock(top, tfp, 1);
+    
+    std::cout << "Read 0x" << std::hex << data << " from register " << (int)addr << std::dec << std::endl;
+    
+    return data;
+}
+
+// Function to wait for busy bit to clear
+void wait_for_busy_clear(Vtop_fault_injection_system* top, VerilatedVcdC* tfp, int max_cycles = 1000) {
+    std::cout << "Waiting for BUSY to clear..." << std::endl;
+    
+    uint32_t status;
+    int cycle_count = 0;
+    
+    do {
+        status = read_register(top, tfp, STATUS_REG);
+        if (++cycle_count >= max_cycles) {
+            std::cerr << "Error: Timeout waiting for BUSY bit to clear!" << std::endl;
+            break;
+        }
+    } while (status & 0x01);
+    
+    std::cout << "BUSY cleared after " << cycle_count << " cycles" << std::endl;
+}
+
+// Function to run posit addition and observe results
+void run_posit_add(Vtop_fault_injection_system* top, VerilatedVcdC* tfp, uint16_t in1, uint16_t in2) {
+    std::cout << "Running posit addition: 0x" << std::hex << in1 << " + 0x" << in2 << std::dec << std::endl;
+    
+    // Set inputs
+    top->posit_in1 = in1;
+    top->posit_in2 = in2;
+    top->posit_start = 1;
+    
+    // Pulse clock
+    toggle_clock(top, tfp, 1);
+    
+    // Deassert start
+    top->posit_start = 0;
+    
+    // Wait for completion (looking at posit_done)
+    int cycle_count = 0;
+    const int max_cycles = 50;
+    
+    while (!top->posit_done && cycle_count < max_cycles) {
+        toggle_clock(top, tfp, 1);
+        cycle_count++;
+    }
+    
+    if (cycle_count >= max_cycles) {
+        std::cerr << "Error: Timeout waiting for posit operation to complete!" << std::endl;
+    }
+    
+    // Allow a few more cycles for results to propagate
+    toggle_clock(top, tfp, 5);
+    
+    // Display results
+    std::cout << "Result: 0x" << std::hex << top->posit_out 
+              << " (inf=" << top->posit_inf
+              << ", zero=" << top->posit_zero 
+              << ")" << std::dec << std::endl;
+}
+
+int main(int argc, char** argv) {
+    // Initialize Verilator
+    Verilated::commandArgs(argc, argv);
+    
+    // Create an instance of the top module
+    Vtop_fault_injection_system* top = new Vtop_fault_injection_system;
+    
+    // Enable waveform tracing
+    Verilated::traceEverOn(true);
+    VerilatedVcdC* tfp = new VerilatedVcdC;
+    top->trace(tfp, 99);
+    tfp->open("dump.vcd");
+    
+    // Initialize inputs
+    top->clk = 0;
+    top->rst = 1;  // Start with reset asserted
+    top->cpu_wren = 0;
+    top->cpu_rden = 0;
+    top->cpu_addr = 0;
+    top->cpu_wdata = 0;
+    top->posit_in1 = 0;
+    top->posit_in2 = 0;
+    top->posit_start = 0;
+    
+    std::cout << "=== Starting Stuck-at Fault Injection Test ===" << std::endl;
+    
+    // Start with a few clock cycles
+    toggle_clock(top, tfp, 5);
+    
+    // Apply reset
+    std::cout << "Applying reset..." << std::endl;
+    top->rst = 0;  // Assert reset (active low to match shift_register)
+    toggle_clock(top, tfp, 3);
+    top->rst = 1;  // Release reset
+    toggle_clock(top, tfp, 5);
+    
+    // ============ Test 1: No Fault Injection (baseline) ============
+    std::cout << "\n--- Test 1: Baseline (No Fault Injection) ---" << std::endl;
+    
+    // Set STATUS register with no setup/start flags but a valid shift register length
+    // 532 = 0x214 (bits 19:4), Fault type 01 (stuck-at-1) (bits 21:20)
+    write_register(top, tfp, STATUS_REG, 0x00105B0);
+    
+    // Run posit addition without fault injection
+    run_posit_add(top, tfp, 0x4000, 0x5000);  // Example posit values
+    run_posit_add(top, tfp, 0x7C00, 0x7C00);  // Max positive values
+    
+    // ============ Test 2: Stuck-at-1 Fault Injection ============
+    std::cout << "\n--- Test 2: Stuck-at-1 Fault Injection ---" << std::endl;
+    
+    // Set STATUS register - fault type stuck-at-1 (01) and shift length 532 (0x214)
+    write_register(top, tfp, STATUS_REG, 0x00105B0);
+    
+    // Write to DATA register with fault pattern (17 writes for 524 bits + 8 control bits)
+    // For simplicity, we'll set every 8th bit to 1 (0x01010101 pattern for each 32-bit write)
+    for (int i = 0; i < 17; i++) {
+        write_register(top, tfp, DATA_REG, 0x01010101);
+        
+        // Wait for busy bit to clear after each write
+        wait_for_busy_clear(top, tfp);
+    }
+    
+    // Set SETUP bit to start loading shift registers
+    std::cout << "Starting setup phase..." << std::endl;
+    write_register(top, tfp, STATUS_REG, 0x00105B8);  // 0x105B0 | 0x08 (SETUP bit)
+    
+    // Wait for busy bit to clear
+    wait_for_busy_clear(top, tfp);
+    
+    // Set START bit to begin fault injection
+    std::cout << "Starting fault injection..." << std::endl;
+    write_register(top, tfp, STATUS_REG, 0x00105B4);  // 0x105B0 | 0x04 (START bit)
+    
+    // Run posit addition with faults injected
+    run_posit_add(top, tfp, 0x4000, 0x5000);  // Same test values as baseline
+    run_posit_add(top, tfp, 0x7C00, 0x7C00);  // Max positive values
+    
+    // ============ Test 3: Stuck-at-0 Fault Injection ============
+    std::cout << "\n--- Test 3: Stuck-at-0 Fault Injection ---" << std::endl;
+    
+    // Reset hardware
+    std::cout << "Resetting hardware..." << std::endl;
+    top->rst = 0;
+    toggle_clock(top, tfp, 3);
+    top->rst = 1;
+    toggle_clock(top, tfp, 5);
+    
+    // Set STATUS register - fault type stuck-at-0 (00) and shift length 532 (0x214)
+    write_register(top, tfp, STATUS_REG, 0x00005B0);
+    
+    // Write to DATA register with fault pattern
+    // For simplicity, we'll set every other bit to 1 (0x55555555 pattern)
+    for (int i = 0; i < 17; i++) {
+        write_register(top, tfp, DATA_REG, 0x55555555);
+        
+        // Wait for busy bit to clear after each write
+        wait_for_busy_clear(top, tfp);
+    }
+    
+    // Set SETUP bit to start loading shift registers
+    std::cout << "Starting setup phase..." << std::endl;
+    write_register(top, tfp, STATUS_REG, 0x00005B8);  // 0x5B0 | 0x08 (SETUP bit)
+    
+    // Wait for busy bit to clear
+    wait_for_busy_clear(top, tfp);
+    
+    // Set START bit to begin fault injection
+    std::cout << "Starting fault injection..." << std::endl;
+    write_register(top, tfp, STATUS_REG, 0x00005B4);  // 0x5B0 | 0x04 (START bit)
+    
+    // Run posit addition with faults injected
+    run_posit_add(top, tfp, 0x4000, 0x5000);  // Same test values as baseline
+    run_posit_add(top, tfp, 0x7C00, 0x7C00);  // Max positive values
+    
+    // ============ Final cleanup ============
+    
+    // Run a few more cycles to finish any remaining activity
+    toggle_clock(top, tfp, 10);
+    
+    // Close trace file
+    tfp->close();
+    
+    // Cleanup
+    top->final();
+    delete top;
+    delete tfp;
+    
+    std::cout << "\nSimulation completed successfully" << std::endl;
+    return 0;
+}
